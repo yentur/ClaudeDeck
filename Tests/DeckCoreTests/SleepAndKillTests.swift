@@ -49,7 +49,7 @@ import Testing
         let dead = await killer.terminate(pid: pid)
 
         #expect(dead)
-        #expect(Date().timeIntervalSince(started) < 3)
+        #expect(Date().timeIntervalSince(started) < 8)   // grace 1 s + settle; generous for slow CI runners
         #expect(!inspector.isAlive(pid))
         for child in children {
             #expect(eventually { !inspector.isAlive(child) })

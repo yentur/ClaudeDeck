@@ -129,6 +129,20 @@ final class FakeRunner: CommandRunner, @unchecked Sendable {
         #expect(result.output.contains("merhaba"))
     }
 
+    @Test func processRunnerWorksWhileDispatchPoolIsBusy() throws {
+        // CI runners have few cores; blocked GCD workers must not stall reading the child's output.
+        let busy = DispatchGroup()
+        for _ in 0..<(ProcessInfo.processInfo.activeProcessorCount * 4) {
+            DispatchQueue.global().async(group: busy) { Thread.sleep(forTimeInterval: 3) }
+        }
+        let started = Date()
+        let result = try ProcessRunner(timeout: 10).run("/bin/sh", ["-c", "echo merhaba; exit 3"])
+        #expect(Date().timeIntervalSince(started) < 2)
+        #expect(result.status == 3)
+        #expect(result.output.contains("merhaba"))
+        busy.wait()
+    }
+
     @Test func processRunnerKeepsLargeOutput() throws {
         let result = try ProcessRunner(timeout: 10).run("/bin/sh", ["-c", "/usr/bin/head -c 300000 /dev/zero | /usr/bin/tr '\\\\0' a"])
         #expect(result.status == 0)

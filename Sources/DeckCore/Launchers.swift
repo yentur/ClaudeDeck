@@ -97,20 +97,21 @@ public struct ProcessRunner: CommandRunner {
         process.standardInput = FileHandle.nullDevice
 
         let output = OutputBuffer()
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            output.markExited()
-            finished.signal()
-        }
+        process.terminationHandler = { _ in output.markExited() }
         try process.run()
 
-        // Don't wait for EOF: any process spawned concurrently (by this app or a parallel test) can
-        // inherit the pipe's write end and keep it open long after our child exits. Read non-blocking
-        // instead, and stop once the child has exited and its buffered output is drained.
+        // Read on a dedicated thread, not a dispatch queue: on small CI machines the shared pools can be
+        // saturated by blocked work, and nothing here may depend on them being responsive. Don't wait
+        // for EOF either: processes spawned concurrently can inherit the pipe's write end and keep it
+        // open long after our child exits. Read non-blocking and stop once the child has exited (seen
+        // directly in the process table, which doesn't depend on Foundation's termination callback)
+        // and its buffered output is drained.
+        let pid = process.processIdentifier
         let fd = pipe.fileHandleForReading.fileDescriptor
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         let readDone = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        let reader = Thread {
+            let inspector = SystemProcessInspector()
             var chunk = [UInt8](repeating: 0, count: 16_384)
             func drain() -> Bool {   // false once EOF or a hard error is reached
                 while true {
@@ -125,9 +126,8 @@ public struct ProcessRunner: CommandRunner {
                 }
             }
             while drain() {
-                // Everything the child wrote is buffered by the time it has exited: one last drain.
-                if output.hasExited {
-                    _ = drain()
+                if output.hasExited || !inspector.isAlive(pid) {
+                    _ = drain()   // everything the child wrote is buffered once it has exited
                     break
                 }
                 var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
@@ -135,13 +135,13 @@ public struct ProcessRunner: CommandRunner {
             }
             readDone.signal()
         }
+        reader.start()
 
-        let deadline = DispatchTime.now() + timeout
-        if finished.wait(timeout: deadline) == .timedOut {
+        if readDone.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()
             throw LaunchError.timedOut(executable)
         }
-        _ = readDone.wait(timeout: .now() + 5)
+        process.waitUntilExit()
         return CommandResult(status: process.terminationStatus, output: String(decoding: output.get(), as: UTF8.self))
     }
 }
