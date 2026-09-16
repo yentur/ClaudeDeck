@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Skip if the release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # scripts/release.sh creates the release (as a draft) before the tag is pushed.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Swift version
+        if: steps.existing.outputs.skip != 'true'
+        run: swift --version
+
+      - name: Test
+        if: steps.existing.outputs.skip != 'true'
+        run: swift test
+
+      - name: Build universal app
+        if: steps.existing.outputs.skip != 'true'
+        run: ./scripts/build-app.sh --universal --version "${GITHUB_REF_NAME#v}" --zip
+
+      - name: Extract release notes from CHANGELOG.md
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Everything between "## [X.Y.Z]" and the next "## [" heading (or the link references at the bottom).
+          awk -v header="## [$VERSION]" '
+            index($0, header) == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error file=CHANGELOG.md::No '## [$VERSION]' section found in CHANGELOG.md"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cat notes.md
+
+      - name: Create GitHub release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/ClaudeDeck-*.zip dist/ClaudeDeck-*.zip.sha256 \
+            --title "ClaudeDeck $VERSION" --notes-file notes.md ${prerelease[@]+"${prerelease[@]}"}
