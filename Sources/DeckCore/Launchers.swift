@@ -16,15 +16,28 @@ public protocol CommandRunner: Sendable {
     func run(_ executable: String, _ arguments: [String], adding environment: [String: String]) throws -> CommandResult
 }
 
-/// Pipe output handed from the reader thread to the caller.
+/// Pipe output collected by the reader thread, plus the "child has exited" flag it watches.
 private final class OutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
+    private var exited = false
 
-    func set(_ value: Data) {
+    func append(_ bytes: UnsafeRawBufferPointer) {
         lock.lock()
-        data = value
+        data.append(contentsOf: bytes)
         lock.unlock()
+    }
+
+    func markExited() {
+        lock.lock()
+        exited = true
+        lock.unlock()
+    }
+
+    var hasExited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exited
     }
 
     func get() -> Data {
@@ -83,14 +96,43 @@ public struct ProcessRunner: CommandRunner {
         process.standardError = pipe
         process.standardInput = FileHandle.nullDevice
 
+        let output = OutputBuffer()
         let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in finished.signal() }
+        process.terminationHandler = { _ in
+            output.markExited()
+            finished.signal()
+        }
         try process.run()
 
-        let output = OutputBuffer()
+        // Don't wait for EOF: any process spawned concurrently (by this app or a parallel test) can
+        // inherit the pipe's write end and keep it open long after our child exits. Read non-blocking
+        // instead, and stop once the child has exited and its buffered output is drained.
+        let fd = pipe.fileHandleForReading.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         let readDone = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            output.set(pipe.fileHandleForReading.readDataToEndOfFile())
+            var chunk = [UInt8](repeating: 0, count: 16_384)
+            func drain() -> Bool {   // false once EOF or a hard error is reached
+                while true {
+                    let count = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+                    if count > 0 {
+                        chunk.withUnsafeBytes { output.append(UnsafeRawBufferPointer(rebasing: $0.prefix(count))) }
+                    } else if count == 0 {
+                        return false
+                    } else {
+                        return errno == EAGAIN || errno == EINTR
+                    }
+                }
+            }
+            while drain() {
+                // Everything the child wrote is buffered by the time it has exited: one last drain.
+                if output.hasExited {
+                    _ = drain()
+                    break
+                }
+                var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                _ = poll(&poller, 1, 50)
+            }
             readDone.signal()
         }
 
@@ -99,9 +141,7 @@ public struct ProcessRunner: CommandRunner {
             process.terminate()
             throw LaunchError.timedOut(executable)
         }
-        // The pipe drains after exit; on a busy machine that can take well over a second. Give it the
-        // rest of the timeout (at least 5 s) rather than returning with the output still unread.
-        _ = readDone.wait(timeout: max(deadline, .now() + 5))
+        _ = readDone.wait(timeout: .now() + 5)
         return CommandResult(status: process.terminationStatus, output: String(decoding: output.get(), as: UTF8.self))
     }
 }

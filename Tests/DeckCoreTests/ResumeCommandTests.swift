@@ -120,6 +120,21 @@ final class FakeRunner: CommandRunner, @unchecked Sendable {
         #expect(CmuxFocus.appBundle(containing: "/usr/local/bin/cmux") == nil)
     }
 
+    @Test func processRunnerDoesNotWaitForInheritedPipeWriters() throws {
+        // The background sleep inherits stdout and keeps the pipe open after the shell exits.
+        let started = Date()
+        let result = try ProcessRunner(timeout: 10).run("/bin/sh", ["-c", "echo merhaba; /bin/sleep 4 & exit 3"])
+        #expect(Date().timeIntervalSince(started) < 2.5)
+        #expect(result.status == 3)
+        #expect(result.output.contains("merhaba"))
+    }
+
+    @Test func processRunnerKeepsLargeOutput() throws {
+        let result = try ProcessRunner(timeout: 10).run("/bin/sh", ["-c", "/usr/bin/head -c 300000 /dev/zero | /usr/bin/tr '\\\\0' a"])
+        #expect(result.status == 0)
+        #expect(result.output.count == 300_000)
+    }
+
     @Test func processRunnerCapturesOutputAndStatus() throws {
         let result = try ProcessRunner().run("/bin/sh", ["-c", "echo merhaba; exit 3"])
         #expect(result.status == 3)
