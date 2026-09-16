@@ -16,6 +16,24 @@ public protocol CommandRunner: Sendable {
     func run(_ executable: String, _ arguments: [String], adding environment: [String: String]) throws -> CommandResult
 }
 
+/// Pipe output handed from the reader thread to the caller.
+private final class OutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func set(_ value: Data) {
+        lock.lock()
+        data = value
+        lock.unlock()
+    }
+
+    func get() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
 extension CommandRunner {
     public func run(_ executable: String, _ arguments: [String], adding environment: [String: String]) throws -> CommandResult {
         try run(executable, arguments)
@@ -69,19 +87,22 @@ public struct ProcessRunner: CommandRunner {
         process.terminationHandler = { _ in finished.signal() }
         try process.run()
 
-        var data = Data()
+        let output = OutputBuffer()
         let readDone = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            output.set(pipe.fileHandleForReading.readDataToEndOfFile())
             readDone.signal()
         }
 
-        if finished.wait(timeout: .now() + timeout) == .timedOut {
+        let deadline = DispatchTime.now() + timeout
+        if finished.wait(timeout: deadline) == .timedOut {
             process.terminate()
             throw LaunchError.timedOut(executable)
         }
-        _ = readDone.wait(timeout: .now() + 1)
-        return CommandResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+        // The pipe drains after exit; on a busy machine that can take well over a second. Give it the
+        // rest of the timeout (at least 5 s) rather than returning with the output still unread.
+        _ = readDone.wait(timeout: max(deadline, .now() + 5))
+        return CommandResult(status: process.terminationStatus, output: String(decoding: output.get(), as: UTF8.self))
     }
 }
 
